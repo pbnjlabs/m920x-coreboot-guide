@@ -1,4 +1,6 @@
 #!/usr/bin/python3 -I
+# SPDX-License-Identifier: MIT
+# Copyright (c) 2026 pbnjlabs
 # Dump the NCT6686D EC pages that hold the fan and temperature-sensor config,
 # and decode the per-fan settings.
 #

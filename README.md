@@ -90,8 +90,9 @@ firmware. The `.gitignore` here blocks `*.bin`, `*.rom`, `*.tar` and `*.gpg` fil
 
 Copyright © 2026 pbnjlabs.
 
-- **Guide, configs and tools:** [Creative Commons Attribution 4.0 International (CC BY 4.0)](https://creativecommons.org/licenses/by/4.0/).
+- **Guide and configs:** [Creative Commons Attribution 4.0 International (CC BY 4.0)](https://creativecommons.org/licenses/by/4.0/).
   You can share and adapt them for any purpose, including commercially, as long as you give
   appropriate credit, link to the license, and say if you made changes. The full text is in
   [`LICENSE`](LICENSE).
+- **Scripts in `tools/`:** [MIT](tools/LICENSE).
 - **The patch in `patches/`:** modifies coreboot, so it's **GPL-2.0-only**, like coreboot.

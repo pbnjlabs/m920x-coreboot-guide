@@ -1,4 +1,6 @@
 #!/bin/bash
+# SPDX-License-Identifier: MIT
+# Copyright (c) 2026 pbnjlabs
 # Find out which EC PWM output drives which fan: ramps each PWM channel to 100%
 # for 15 s and prints every fan's RPM. The fans get loud.
 #
