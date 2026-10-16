@@ -1,0 +1,334 @@
+From d8aa323bd2b8a725884b67e040c285ce26a1d445 Mon Sep 17 00:00:00 2001
+From: pbnjlabs <328119985+pbnjlabs@users.noreply.github.com>
+Date: Wed, 14 Oct 2026 22:24:01 -0400
+Subject: [PATCH] mb/lenovo/m720q_m920q: Add CPU fan curve, power limits and
+ CFR menu
+
+Without a Super I/O config, nct6687d_hwm_init() writes "disabled" to
+every EC temperature source slot and locks them. The CPU fan channel
+(EC FAN2) keeps following slot 0 and falls back to the default duty
+(~30%), whatever the CPU temperature.
+
+- Use PECI as sensor slot 0 and run FAN2 (TACH pin 10, PWM pin 9) in
+  Smart Fan IV mode, with full speed at 95 C or on a sensor error.
+- Add a CFR setup menu: Hyper-Threading, power on after failure,
+  PL1/PL2 and a CPU fan profile (Balanced/Quiet/Performance/Full speed).
+- Default PL1/PL2 to 35/45 W. An i9-9900 at 65/65 W cut power within
+  ~30 s of an all-thread load on an M920x.
+- superio/nuvoton/nct6687d: clear EC-default algorithm features
+  (DTS, smart tracking, ambient floor, ...) that the devicetree did not
+  request, keeping FAN_ALG_FUNCTRL_ALG_EN. Left on, they made the fan
+  surge between ~1500 and ~6200 RPM.
+
+TEST=M920x, i9-9900: fan follows CPU temperature under 4- and
+16-thread load, peak 74-77 C, no power loss.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/mainboard/lenovo/m720q_m920q/Kconfig      |  1 +
+ src/mainboard/lenovo/m720q_m920q/Makefile.mk  |  2 +
+ src/mainboard/lenovo/m720q_m920q/cfr.c        | 77 +++++++++++++++++++
+ .../lenovo/m720q_m920q/devicetree.cb          | 27 ++++++-
+ src/mainboard/lenovo/m720q_m920q/fan.c        | 56 ++++++++++++++
+ .../m720q_m920q/include/mainboard/fan.h       | 15 ++++
+ src/mainboard/lenovo/m720q_m920q/ramstage.c   |  2 +
+ src/superio/nuvoton/nct6687d/nct6687d_hwm.c   | 17 ++++
+ 8 files changed, 195 insertions(+), 2 deletions(-)
+ create mode 100644 src/mainboard/lenovo/m720q_m920q/cfr.c
+ create mode 100644 src/mainboard/lenovo/m720q_m920q/fan.c
+ create mode 100644 src/mainboard/lenovo/m720q_m920q/include/mainboard/fan.h
+
+diff --git a/src/mainboard/lenovo/m720q_m920q/Kconfig b/src/mainboard/lenovo/m720q_m920q/Kconfig
+index 40641c211f..fcbe586887 100644
+--- a/src/mainboard/lenovo/m720q_m920q/Kconfig
++++ b/src/mainboard/lenovo/m720q_m920q/Kconfig
+@@ -7,6 +7,7 @@ config BOARD_SPECIFIC_OPTIONS
+ 	select AZALIA_USE_LEGACY_VERB_TABLE
+ 	select BOARD_ROMSIZE_KB_16384 if BOARD_LENOVO_M720Q
+ 	select BOARD_ROMSIZE_KB_24576 if BOARD_LENOVO_M920Q
++	select DRIVERS_OPTION_CFR_ENABLED if PAYLOAD_EDK2 && SMMSTORE
+ 	select DRIVERS_UART_8250IO
+ 	select HAVE_ACPI_RESUME
+ 	select HAVE_ACPI_TABLES
+diff --git a/src/mainboard/lenovo/m720q_m920q/Makefile.mk b/src/mainboard/lenovo/m720q_m920q/Makefile.mk
+index 4be83458d1..282e760f54 100644
+--- a/src/mainboard/lenovo/m720q_m920q/Makefile.mk
++++ b/src/mainboard/lenovo/m720q_m920q/Makefile.mk
+@@ -6,6 +6,8 @@ bootblock-y += bootblock.c
+ 
+ romstage-y += romstage.c
+ 
++ramstage-$(CONFIG_DRIVERS_OPTION_CFR) += cfr.c
++ramstage-y += fan.c
+ ramstage-y += gpio.c
+ ramstage-y += hda_verb.c
+ ramstage-y += ramstage.c
+diff --git a/src/mainboard/lenovo/m720q_m920q/cfr.c b/src/mainboard/lenovo/m720q_m920q/cfr.c
+new file mode 100644
+index 0000000000..7639f0d9fc
+--- /dev/null
++++ b/src/mainboard/lenovo/m720q_m920q/cfr.c
+@@ -0,0 +1,77 @@
++/* SPDX-License-Identifier: GPL-2.0-only */
++
++#include <boot/coreboot_tables.h>
++#include <drivers/option/cfr_frontend.h>
++#include <intelblocks/cfr.h>
++#include <mainboard/fan.h>
++
++static const struct sm_object fan_profile = SM_DECLARE_ENUM({
++	.opt_name	= "fan_profile",
++	.ui_name	= "CPU fan profile",
++	.ui_helptext	= "Select the CPU fan speed curve. The fan follows the CPU\n"
++			  "temperature reported over PECI.",
++	.default_value	= FAN_PROFILE_BALANCED,
++	.values		= (const struct sm_enum_value[]) {
++				{ "Balanced",		FAN_PROFILE_BALANCED	},
++				{ "Quiet",		FAN_PROFILE_QUIET	},
++				{ "Performance",	FAN_PROFILE_PERFORMANCE	},
++				{ "Full speed",		FAN_PROFILE_FULL_SPEED	},
++				SM_ENUM_VALUE_END				},
++});
++
++static const struct sm_object tdp_pl1_override = SM_DECLARE_NUMBER({
++	.opt_name	= "tdp_pl1_override",
++	.ui_name	= "CPU PL1 power limit (W)",
++	.ui_helptext	= "Long-duration CPU package power limit.\n"
++			  "Default: 35 W. Range: 15-65 W.\n"
++			  "Values above 35 W can trip the over-current protection\n"
++			  "with 65 W CPUs under sustained all-core load.",
++	.default_value	= 35,
++	.min		= 15,
++	.max		= 65,
++	.step		= 1,
++	.display_flags	= 0,
++});
++
++static const struct sm_object tdp_pl2_override = SM_DECLARE_NUMBER({
++	.opt_name	= "tdp_pl2_override",
++	.ui_name	= "CPU PL2 power limit (W)",
++	.ui_helptext	= "Short-duration CPU package power limit.\n"
++			  "Default: 45 W. Range: 15-65 W.\n"
++			  "Raised to PL1 if set lower than PL1.",
++	.default_value	= 45,
++	.min		= 15,
++	.max		= 65,
++	.step		= 1,
++	.display_flags	= 0,
++});
++
++static struct sm_obj_form system = {
++	.ui_name = "System",
++	.obj_list = (const struct sm_object *[]) {
++		&hyper_threading,
++		NULL
++	},
++};
++
++static struct sm_obj_form power = {
++	.ui_name = "Power",
++	.obj_list = (const struct sm_object *[]) {
++		&power_on_after_fail,
++		&tdp_pl1_override,
++		&tdp_pl2_override,
++		&fan_profile,
++		NULL
++	},
++};
++
++static struct sm_obj_form *sm_root[] = {
++	&system,
++	&power,
++	NULL
++};
++
++void mb_cfr_setup_menu(struct lb_cfr *cfr_root)
++{
++	cfr_write_setup_menu(cfr_root, sm_root);
++}
+diff --git a/src/mainboard/lenovo/m720q_m920q/devicetree.cb b/src/mainboard/lenovo/m720q_m920q/devicetree.cb
+index 9e704b4471..83d4561305 100644
+--- a/src/mainboard/lenovo/m720q_m920q/devicetree.cb
++++ b/src/mainboard/lenovo/m720q_m920q/devicetree.cb
+@@ -1,8 +1,12 @@
+ ## SPDX-License-Identifier: GPL-2.0-only
+ 
+ chip soc/intel/cannonlake
++	# The Tiny chassis is designed for 35 W T-series CPUs. A 65 W CPU drawing
++	# 65 W on all cores has been seen to cut power (likely over-current
++	# protection), so default to T-series limits. Adjustable in setup.
+ 	register "power_limits_config" = "{
+-		.tdp_pl2_override = 65,
++		.tdp_pl1_override = 35,
++		.tdp_pl2_override = 45,
+ 	}"
+ 
+ 	# Unmap unused CLKREQ lines, otherwise CLKSRC #0 won't work
+@@ -92,6 +96,25 @@ chip soc/intel/cannonlake
+ 
+ 		device ref lpc_espi	on
+ 			chip superio/nuvoton/nct6687d
++				# CPU temperature via PECI, used as fan temperature source 1
++				register "sensors[0]" = "PECI_AGENT0_DOMAIN0"
++				register "peci_speed" = "PECI_1200KHZ"
++
++				# CPU_FAN: TACH on pin 10, PWM on pin 9. The speed curve is
++				# replaced at runtime by the selected fan_profile option.
++				register "FAN2.mode" = "FAN_SMART_FAN_IV"
++				register "FAN2.unit_sel" = "FAN_PWM"
++				register "FAN2.fanin_sel" = "TACH_PWM10"
++				register "FAN2.fanout_sel" = "TACH_PWM9"
++				register "FAN2.crit_temp" = "95"
++				register "FAN2.temp_err_duty" = "0xff"
++				register "FAN2.smart_fan.temp_src" = "{ 1, 0, 0, 0 }"
++				register "FAN2.smart_fan.temp_levels" = "{ 45, 55, 65, 75, 82, 88, 93 }"
++				register "FAN2.smart_fan.speed_levels" = "{ 25, 30, 40, 55, 75, 90, 100 }"
++				register "FAN2.smart_fan.cut_off_delay" = "5"
++				register "FAN2.smart_fan.step_up_time" = "1"
++				register "FAN2.smart_fan.step_down_time" = "1"
++
+ 				device pnp 2e.1 off	end	# Parallel port
+ 				device pnp 2e.2 off	end	# UARTA (USB debug port?)
+ 				device pnp 2e.3 on		# UARTB - COM1 header - optional sub-board
+@@ -109,7 +132,7 @@ chip soc/intel/cannonlake
+ 					io 0x60 = 0x00
+ 					irq 0x70 = 0x40
+ 				end
+-				device pnp 2e.b on		# EC
++				device pnp 2e.b alias superio_ec on	# EC
+ 					io 0x60 = 0xa20
+ 					irq 0x70 = 0
+ 				end
+diff --git a/src/mainboard/lenovo/m720q_m920q/fan.c b/src/mainboard/lenovo/m720q_m920q/fan.c
+new file mode 100644
+index 0000000000..2dab91e3dd
+--- /dev/null
++++ b/src/mainboard/lenovo/m720q_m920q/fan.c
+@@ -0,0 +1,56 @@
++/* SPDX-License-Identifier: GPL-2.0-only */
++
++#include <commonlib/bsd/helpers.h>
++#include <console/console.h>
++#include <device/device.h>
++#include <mainboard/fan.h>
++#include <option.h>
++#include <static.h>
++#include <string.h>
++#include <superio/nuvoton/nct6687d/chip.h>
++
++struct fan_curve {
++	const char *name;
++	uint8_t temp_levels[MAX_TEMP_SPEED_LEVELS];
++	uint16_t speed_levels[MAX_TEMP_SPEED_LEVELS];
++};
++
++/* Temperatures in degrees C, speeds in percent PWM duty */
++static const struct fan_curve fan_curves[] = {
++	[FAN_PROFILE_BALANCED] = {
++		.name = "Balanced",
++		.temp_levels = { 45, 55, 65, 75, 82, 88, 93 },
++		.speed_levels = { 25, 30, 40, 55, 75, 90, 100 },
++	},
++	[FAN_PROFILE_QUIET] = {
++		.name = "Quiet",
++		.temp_levels = { 50, 60, 70, 80, 85, 90, 93 },
++		.speed_levels = { 20, 25, 35, 50, 70, 90, 100 },
++	},
++	[FAN_PROFILE_PERFORMANCE] = {
++		.name = "Performance",
++		.temp_levels = { 40, 50, 60, 70, 78, 85, 90 },
++		.speed_levels = { 35, 45, 55, 70, 85, 100, 100 },
++	},
++	[FAN_PROFILE_FULL_SPEED] = {
++		.name = "Full speed",
++		.temp_levels = { 1, 1, 1, 1, 1, 1, 1 },
++		.speed_levels = { 100, 100, 100, 100, 100, 100, 100 },
++	},
++};
++
++void mainboard_apply_fan_profile(void)
++{
++	struct superio_nuvoton_nct6687d_config *conf = config_of(DEV_PTR(superio_ec));
++	unsigned int profile = get_uint_option("fan_profile", FAN_PROFILE_BALANCED);
++
++	if (profile >= ARRAY_SIZE(fan_curves))
++		profile = FAN_PROFILE_BALANCED;
++
++	memcpy(conf->FAN2.smart_fan.temp_levels, fan_curves[profile].temp_levels,
++	       sizeof(conf->FAN2.smart_fan.temp_levels));
++	memcpy(conf->FAN2.smart_fan.speed_levels, fan_curves[profile].speed_levels,
++	       sizeof(conf->FAN2.smart_fan.speed_levels));
++
++	printk(BIOS_INFO, "CPU fan profile: %s\n", fan_curves[profile].name);
++}
+diff --git a/src/mainboard/lenovo/m720q_m920q/include/mainboard/fan.h b/src/mainboard/lenovo/m720q_m920q/include/mainboard/fan.h
+new file mode 100644
+index 0000000000..ab66cef45a
+--- /dev/null
++++ b/src/mainboard/lenovo/m720q_m920q/include/mainboard/fan.h
+@@ -0,0 +1,15 @@
++/* SPDX-License-Identifier: GPL-2.0-only */
++
++#ifndef MAINBOARD_FAN_H
++#define MAINBOARD_FAN_H
++
++enum fan_profile {
++	FAN_PROFILE_BALANCED = 0,
++	FAN_PROFILE_QUIET,
++	FAN_PROFILE_PERFORMANCE,
++	FAN_PROFILE_FULL_SPEED,
++};
++
++void mainboard_apply_fan_profile(void);
++
++#endif
+diff --git a/src/mainboard/lenovo/m720q_m920q/ramstage.c b/src/mainboard/lenovo/m720q_m920q/ramstage.c
+index e94ca02030..00cac40813 100644
+--- a/src/mainboard/lenovo/m720q_m920q/ramstage.c
++++ b/src/mainboard/lenovo/m720q_m920q/ramstage.c
+@@ -1,5 +1,6 @@
+ /* SPDX-License-Identifier: GPL-2.0-only */
+ 
++#include <mainboard/fan.h>
+ #include <mainboard/gpio.h>
+ #include <soc/gpio.h>
+ #include <soc/ramstage.h>
+@@ -7,6 +8,7 @@
+ static void mainboard_enable(struct device *dev)
+ {
+ 	mainboard_configure_gpios();
++	mainboard_apply_fan_profile();
+ }
+ 
+ struct chip_operations mainboard_ops = {
+diff --git a/src/superio/nuvoton/nct6687d/nct6687d_hwm.c b/src/superio/nuvoton/nct6687d/nct6687d_hwm.c
+index e7d80f493d..2a6ecdb9ce 100644
+--- a/src/superio/nuvoton/nct6687d/nct6687d_hwm.c
++++ b/src/superio/nuvoton/nct6687d/nct6687d_hwm.c
+@@ -565,6 +565,23 @@ static void set_fan_pins_and_mode(const struct nct6687d_fan_config *fan, unsigne
+ 	if (mode == FAN_MODE_MANUAL)
+ 		mode = 0;
+ 
++	/*
++	 * Drop algorithm features left enabled by the EC firmware defaults. They
++	 * would act on top of the selected mode with settings not provided by
++	 * the devicetree. Requested features are re-enabled in misc_fan_config().
++	 * FAN_ALG_FUNCTRL_ALG_EN is kept, the fan does not follow the selected
++	 * mode without it.
++	 */
++	hwm_reg_and_or(FAN_ALG_FUNCTRL_REG(idx),
++		       ~(FAN_ALG_FUNCTRL_CRIT_TEMP_EN |
++			 FAN_ALG_FUNCTRL_TEMP_ERR | FAN_ALG_FUNCTRL_DTS1_EN |
++			 FAN_ALG_FUNCTRL_DTS2_EN | FAN_ALG_FUNCTRL_DTS_UB_EN) & 0xff, 0);
++	hwm_reg_and_or(FAN_FUNCTION_CTRL(idx),
++		       ~(FAN_FUN_SMART_TRACK_EN | FAN_FUN_FAST_TRACK_EN |
++			 FAN_FUN_MARKUP_TRACK_EN | FAN_FUN_AMBIENT_FLOOR_EN |
++			 FAN_FUN_STARTUP_EN | FAN_FUN_MANUAL_OFFSET_EN |
++			 FAN_FUN_MINDUTY_EN) & 0xff, 0);
++
+ 	hwm_reg_and_or(FAN_MODE_SEL_REG(idx), ~FAN_MODE_SEL_MASK, mode & FAN_MODE_SEL_MASK);
+ 	hwm_reg_and_or(FANIN_CFG_REG(idx), ~FANIN_PIN_SEL_MASK,
+ 		       fan->fanin_sel & FANIN_PIN_SEL_MASK);
+-- 
+2.55.0
+

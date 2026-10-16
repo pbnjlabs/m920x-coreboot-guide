@@ -1,0 +1,7 @@
+# Firmware images and dumps contain unit-specific data (serial number, MAC
+# address) and proprietary Lenovo/Intel code. Never commit them.
+*.bin
+*.rom
+*.tar
+*.gpg
+regions/
